@@ -9,8 +9,8 @@ import pandas as pd
 from rdkit import Chem
 
 from docking_pose_visualizer_block import build_docking_pose_visualizer_js
-from scaffold_summary_helpers import filter_sig_to_positions, mol_png_base64_from_smiles, representative_ranked_subset
-from shared_utils import hash_text
+from scaffold_summary_helpers import filter_sig_to_positions, mol_png_base64_from_smiles, mol_png_base64_from_smiles_with_status, representative_ranked_subset
+from shared_utils import hash_text, safe_float
 
 
 _REPORT_HELPERS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -377,6 +377,9 @@ def molecule_tile_html(
         f"rotB: {row.get('rot_bonds')} | TPSA: {row.get('tpsa')}"
         f"</div>"
     )
+    torsion_angle = safe_float(row.get("torsion_angle"))
+    if torsion_angle is not None:
+        parts.append(f"<div class='smalltxt'>Torsion: {torsion_angle:.2f} deg</div>")
     # Add the 5 special properties if available.
     if mol_props_data is not None and prop_names_list is not None:
         mol_id = str(row.get("mol_id", ""))
@@ -430,6 +433,7 @@ def build_idea_cards(
     scaffold_prop_ranges=None,
     scaffold_unique_member_counts=None,
     global_reference_smiles=None,
+    global_reference_core_smarts=None,
 ):
     if df.empty:
         return "<p><i>None</i></p>"
@@ -438,12 +442,23 @@ def build_idea_cards(
     for _, row in df.iterrows():
         sname = str(row.get("scaffold_name", ""))
         sname_js = sname.replace("\\", "\\\\").replace("'", "\\'")
+        mol_index = row.get("mol_index")
+        mol_id = str(row.get("mol_id") or row.get("scaffold_name") or "Molecule")
+        card_click_attr = ""
+        if mol_index is not None and not pd.isna(mol_index):
+            midx = int(mol_index)
+            mol_label_js = mol_id.replace("\\", "\\\\").replace("'", "\\'")
+            card_click_attr = (
+                " data-mol-index='" + str(midx) + "'"
+                + " data-mol-label='" + html.escape(mol_id, quote=True) + "'"
+                + " style='cursor:pointer;'"
+                + " onclick=\"if(event&&event.target&&event.target.closest('button,input,select,textarea,label,a')){return;}"
+                + "if(typeof _openPoseVisualizerWindow==='function'){_openPoseVisualizerWindow(" + str(midx) + ",'" + mol_label_js + "');}"
+                + "else if(typeof _showPoseFromIndex==='function'){_showPoseFromIndex(" + str(midx) + ",'" + mol_label_js + "');}"
+                + "else if(typeof _renderPoseFromIndex==='function'){_renderPoseFromIndex(" + str(midx) + ",'" + mol_label_js + "');}\""
+            )
         card_id = f"ci-{hash_text(sname)}"
         card_classes = ["idea-card"]
-        if sname in highlight_set:
-            card_classes.append("top15-highlight")
-        if bool(row.get("high_distance_central", False)):
-            card_classes.append("high-distance-highlight")
         cb_html = (
             f"<label style='display:flex;align-items:center;gap:5px;cursor:pointer;'>"
             f"<input type='checkbox' class='scaf-checkbox' data-scaffold='{sname}' "
@@ -515,7 +530,7 @@ def build_idea_cards(
             )
         blocks.append(
             f"<div class='{' '.join(card_classes)}' id='{card_id}' "
-            f"data-scaffold='{sname}' data-n-members='{n_members}'>"
+            f"data-scaffold='{sname}' data-n-members='{n_members}'{card_click_attr}>"
         )
         blocks.append(
             f"<div class='idea-head'>"
@@ -527,26 +542,15 @@ def build_idea_cards(
             blocks.append(f"<div style='margin-top:4px;'>{all_members_cb_html}</div>")
         if include_links and card_type == "Central":
             blocks.append("")
-        mol_label = str(row.get("mol_id") or row.get("scaffold_name") or "Molecule")
-        mol_label_js = json.dumps(mol_label)
-        mol_index = row.get("mol_index")
-        card_img_b64 = mol_png_base64_from_smiles(
+        card_img_b64, aligned_to_template = mol_png_base64_from_smiles_with_status(
             row.get("smiles"),
             size=(420, 270),
-            legend=mol_label,
+            legend=mol_id,
             reference_smiles=global_reference_smiles,
+            reference_core_smarts=global_reference_core_smarts,
         )
         if card_img_b64:
-            if mol_index is not None and not pd.isna(mol_index):
-                midx = int(mol_index)
-                blocks.append(
-                    "<button type='button' style='display:block;border:none;background:transparent;padding:0;cursor:pointer;' "
-                    f"onclick=\"if(typeof _openPoseVisualizerWindow==='function'){{_openPoseVisualizerWindow({midx},{mol_label_js});}}else if(typeof _showPoseFromIndex==='function'){{_showPoseFromIndex({midx},{mol_label_js});}}else{{_renderPoseFromIndex({midx},{mol_label_js});}}\" title='Open docking pose visualizer'>"
-                    f"<img src='data:image/png;base64,{card_img_b64}' alt='{html.escape(mol_label, quote=True)}' decoding='async' style='max-width:330px;width:100%;height:auto;' />"
-                    "</button>"
-                )
-            else:
-                blocks.append(f"<img src='data:image/png;base64,{card_img_b64}' alt='{html.escape(mol_label, quote=True)}' decoding='async' style='max-width:330px;width:100%;height:auto;' />")
+            blocks.append(f"<img src='data:image/png;base64,{card_img_b64}' alt='{html.escape(mol_id, quote=True)}' decoding='async' style='max-width:330px;width:100%;height:auto;' />")
         med_ovr = row.get("median_overall_score")
         med_ovr_str = f"{med_ovr:.2f}" if med_ovr is not None and not (isinstance(med_ovr, float) and pd.isna(med_ovr)) else "—"
         nov = row.get("interaction_novelty")
@@ -555,6 +559,8 @@ def build_idea_cards(
         fsp3_str = f"{fsp3:.2f}" if fsp3 is not None and not (isinstance(fsp3, float) and pd.isna(fsp3)) else "—"
         alip = row.get("scaffold_aliphatic_rings")
         alip_str = str(int(alip)) if alip is not None and not (isinstance(alip, float) and pd.isna(alip)) else "—"
+        torsion_angle = safe_float(row.get("torsion_angle"))
+        torsion_str = f"{torsion_angle:.2f} deg" if torsion_angle is not None else "—"
         struct_badge = ""
         if alip is not None and not (isinstance(alip, float) and pd.isna(alip)) and int(alip) > 0:
             struct_badge = " <span style='background:#d4edda;color:#155724;border-radius:4px;padding:1px 5px;font-size:10px;'>3D scaffold</span>"
@@ -566,7 +572,8 @@ def build_idea_cards(
             f"<b>Median overall:</b> {med_ovr_str} | "
             f"<b>Novelty:</b> {nov_str} | "
             f"<b>Fsp3:</b> {fsp3_str} | "
-            f"<b>Aliph. rings:</b> {alip_str}"
+            f"<b>Aliph. rings:</b> {alip_str} | "
+            f"<b>Torsion:</b> {torsion_str}"
             f"{struct_badge}"
             f"</div>"
         )
@@ -705,6 +712,7 @@ def build_central_card_payload(
     prop_names_ordered=None,
     scaffold_unique_member_counts=None,
     global_reference_smiles=None,
+    global_reference_core_smarts=None,
 ):
     payload = []
     highlight_set = set(highlighted_scaffold_names or [])
@@ -736,6 +744,7 @@ def build_central_card_payload(
                     scaffold_prop_ranges=scaffold_prop_ranges,
                     scaffold_unique_member_counts=scaffold_unique_member_counts,
                     global_reference_smiles=global_reference_smiles,
+                    global_reference_core_smarts=global_reference_core_smarts,
                 ),
             }
         )
@@ -786,6 +795,7 @@ _PROP_DISPLAY_LABELS = {
     "FormalCharge": "Formal Charge",
     "RingCount": "Ring Count",
     "FractionCSP3": "Fsp3",
+    "torsion_angle": "Torsion (deg)",
 }
 
 
@@ -812,9 +822,10 @@ def _compute_prop_stats(mol_props_data, prop_names):
     return stats
 
 
-def _build_prop_panel_html(prop_names, stats):
+def _build_prop_panel_html(prop_names, stats, prop_labels=None):
     """Return the full HTML for the Molecule Properties panel section."""
-    label = _PROP_DISPLAY_LABELS
+    label = dict(_PROP_DISPLAY_LABELS)
+    label.update(prop_labels or {})
 
     # Stats table rows.
     rows_html = ""
@@ -1063,6 +1074,7 @@ def write_html_report(
     top_per_scaffold=12,
     max_scaffolds_in_report=15,
     global_reference_smiles=None,
+    global_reference_core_smarts=None,
     protein_pdb_text=None,
     protein_cartoon_pdb_text=None,
     protein_structure_format="pdb",
@@ -1077,6 +1089,8 @@ def write_html_report(
     pose_interactions_by_index=None,
     mol_props_data=None,
     scaffold_mol_map=None,
+    prop_names_list=None,
+    prop_display_labels=None,
 ):
     html_path = os.path.join(outdir, report_filename)
     structure_assets = ensure_structure_search_assets(outdir)
@@ -1347,8 +1361,6 @@ def write_html_report(
         .scaf-checkbox { width: 16px; height: 16px; cursor: pointer; accent-color: var(--accent); }
         .member-export-toggle { width: 16px; height: 16px; cursor: pointer; accent-color: #1f3551; }
         .idea-card.sel-active { border-color: var(--accent) !important; box-shadow: 0 0 0 2px rgba(11, 110, 79, 0.3); }
-        .idea-card.top15-highlight { border: 2px solid #c84c09; box-shadow: 0 0 0 2px rgba(200, 76, 9, 0.12); }
-        .idea-card.high-distance-highlight { border: 3px solid #22c55e; box-shadow: 0 0 0 2px rgba(34, 197, 94, 0.18); }
         .idea-card.is-deactivated { opacity: 0.42; filter: grayscale(0.35); background: #f6f7f9; }
         .idea-card.is-deactivated a,
         .idea-card.is-deactivated button,
@@ -1561,21 +1573,23 @@ def write_html_report(
         fh.write("</div></details></section>")
 
         # Properties Panel (above Molecule List).
-        _prop_names_ordered = [
+        _prop_names_ordered = list(prop_names_list or [
             "GS_LogD", "GS_Sol_74_linear", "GS_CACO2_A2B_10_linear", "GS_CACO2_B2A_10_linear",
             "GS_HP_Free_LT_linear", "GS_CACO2_A2B_1_linear", "GS_CACO2_B2A_1_linear",
             "GS_HP_Free_linear", "GS_Pred_Cl_HLM_linear", "GS_MDCK_linear", "GS_RED_HP_linear",
             "interaction_count",
             "MW", "cLogP", "TPSA", "HBD", "HBA", "RotBonds", "HeavyAtoms", "FormalCharge",
             "RingCount", "FractionCSP3",
-        ]
+        ])
         _has_props = bool(mol_props_data)
         if _has_props:
             _prop_stats = _compute_prop_stats(mol_props_data, _prop_names_ordered)
             _mol_smiles_lookup = _build_mol_smiles_lookup(mol_df)
-            fh.write(_build_prop_panel_html(_prop_names_ordered, _prop_stats))
+            fh.write(_build_prop_panel_html(_prop_names_ordered, _prop_stats, prop_display_labels))
             # Serialize data constants for JS.
-            _prop_labels_js = {p: _PROP_DISPLAY_LABELS.get(p, p) for p in _prop_names_ordered}
+            _effective_prop_labels = dict(_PROP_DISPLAY_LABELS)
+            _effective_prop_labels.update(prop_display_labels or {})
+            _prop_labels_js = {p: _effective_prop_labels.get(p, p) for p in _prop_names_ordered}
             _prop_names_js = json.dumps(_prop_names_ordered, ensure_ascii=True)
             _prop_labels_json = json.dumps(_prop_labels_js, ensure_ascii=True)
             _mol_props_json = json.dumps(mol_props_data, ensure_ascii=True)
@@ -1614,12 +1628,9 @@ def write_html_report(
             "<button type='button' onclick='clearAllStars()'>Clear All Stars</button>"
             "<button type='button' onclick='activateAllScaffolds()'>Activate All</button>"
             "<input type='search' id='central-scaffold-search' placeholder='Search molecule ID' />"
-            "<label class='filter-chip'><input type='checkbox' id='filter-red-highlight' /> Red highlight</label>"
-            "<label class='filter-chip'><input type='checkbox' id='filter-green-highlight' /> Green highlight</label>"
             "<label class='filter-chip'><input type='checkbox' id='filter-hide-duplicates' checked /> Hide duplicate molecules (canonical SMILES)</label>"
             "</div>"
         )
-        fh.write("<div id='highlight-listing' class='highlight-list smalltxt'>Highlight categories will be listed here.</div>")
         top15_names = (
             central_df.sort_values(["n_members", "central_priority"], ascending=[False, False]).head(15)["scaffold_name"].tolist()
             if not central_df.empty else []
@@ -1635,6 +1646,7 @@ def write_html_report(
             prop_names_ordered=_prop_names_ordered,
             scaffold_unique_member_counts=scaffold_unique_member_counts,
             global_reference_smiles=global_reference_smiles,
+            global_reference_core_smarts=global_reference_core_smarts,
         )
         report_render_payload = {
             "pageSize": central_page_size,

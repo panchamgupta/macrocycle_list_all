@@ -77,8 +77,8 @@ from filtering import apply_report_filters, druglike_score_from_row, weighted_pr
 from progress_tracking import format_elapsed, progress_log, start_progress_bar, finish_progress_bar
 from report_helpers import build_hbond_residue_filter_data, write_html_report
 from ranking_helpers import load_external_interaction_counts, merge_and_rank_molecules, normalize_series
-from scaffold_summary_helpers import mol_png_base64, write_macrocycle_depiction_png
-from shared_utils import hash_text, normalize_id, safe_float
+from scaffold_summary_helpers import compute_common_core_smarts, mol_png_base64, write_macrocycle_depiction_png
+from shared_utils import calculate_torsion_from_smarts, hash_text, normalize_id, safe_float, validate_torsion_smarts
 
 # Module-level Uncharger for pH-7 neutrality (reuse to avoid per-call overhead).
 _UNCHARGER = rdMolStandardize.Uncharger()
@@ -528,15 +528,17 @@ def filter_values_from_sdf_or_descriptors(mol, descriptors):
         "filter_rot_bonds": rot if rot is not None else descriptors.get("rot_bonds"),
         "filter_hbd": hbd if hbd is not None else descriptors.get("hbd"),
         "filter_hba": hba if hba is not None else descriptors.get("hba"),
+        "filter_torsion": descriptors.get("torsion_angle"),
         "filter_mol_wt_source": mw_src or "rdkit",
         "filter_rot_bonds_source": rot_src or "rdkit",
         "filter_hbd_source": hbd_src or "rdkit",
         "filter_hba_source": hba_src or "rdkit",
+        "filter_torsion_source": "smarts" if descriptors.get("torsion_angle") is not None else None,
     }
 
 
 # SDF property names to extract for the HTML properties panel.
-_REPORT_PROP_NAMES = [
+_BASE_REPORT_PROP_NAMES = [
     "GS_LogD", "GS_Sol_74_linear", "GS_CACO2_A2B_10_linear", "GS_CACO2_B2A_10_linear",
     "GS_HP_Free_LT_linear", "GS_CACO2_A2B_1_linear", "GS_CACO2_B2A_1_linear",
     "GS_HP_Free_linear", "GS_Pred_Cl_HLM_linear", "GS_MDCK_linear", "GS_RED_HP_linear",
@@ -544,6 +546,35 @@ _REPORT_PROP_NAMES = [
     "MW", "cLogP", "TPSA", "HBD", "HBA", "RotBonds", "HeavyAtoms", "FormalCharge",
     "RingCount", "FractionCSP3",
 ]
+
+_REPORT_DERIVED_PROP_COLUMNS = {
+    "interaction_count": "interaction_count",
+    "MW": "mol_wt",
+    "cLogP": "clogp",
+    "TPSA": "tpsa",
+    "HBD": "hbd",
+    "HBA": "hba",
+    "RotBonds": "rot_bonds",
+    "HeavyAtoms": "heavy_atoms",
+    "FormalCharge": "formal_charge",
+    "RingCount": "rings",
+    "FractionCSP3": "fsp3",
+    "torsion_angle": "torsion_angle",
+}
+
+
+def _get_report_prop_names(args):
+    prop_names = list(_BASE_REPORT_PROP_NAMES)
+    if str(getattr(args, "torsion_smarts", "") or "").strip():
+        prop_names.append("torsion_angle")
+    return prop_names
+
+
+def _get_report_prop_labels(args):
+    labels = {}
+    if str(getattr(args, "torsion_smarts", "") or "").strip():
+        labels["torsion_angle"] = str(getattr(args, "torsion_label", "Torsion (deg)") or "Torsion (deg)").strip() or "Torsion (deg)"
+    return labels
 
 
 def _extract_mol_props_for_report(sdf_path, mol_df, scaf_df, prop_names, run_started):
@@ -584,14 +615,13 @@ def _extract_mol_props_for_report(sdf_path, mol_df, scaf_df, prop_names, run_sta
     if not idx_to_id:
         return {}, scaffold_mol_map
 
-    interaction_count_map = {}
-    if "mol_id" in mol_df.columns and "interaction_count" in mol_df.columns:
-        for mol_id, count_val in zip(mol_df["mol_id"], mol_df["interaction_count"]):
-            mol_id_txt = str(mol_id)
-            if mol_id_txt in interaction_count_map:
+    mol_prop_lookup = {}
+    if "mol_id" in mol_df.columns:
+        for _, row in mol_df.iterrows():
+            mol_id_txt = str(row.get("mol_id", "") or "")
+            if not mol_id_txt or mol_id_txt in mol_prop_lookup:
                 continue
-            parsed = safe_float(count_val)
-            interaction_count_map[mol_id_txt] = float(parsed) if parsed is not None else 0.0
+            mol_prop_lookup[mol_id_txt] = row
 
     needed = set(idx_to_id.keys())
     mol_props_data: dict = {}
@@ -605,8 +635,14 @@ def _extract_mol_props_for_report(sdf_path, mol_df, scaf_df, prop_names, run_sta
             mol_id = idx_to_id[i]
             vals = []
             for p in prop_names:
-                if p == "interaction_count":
-                    vals.append(round(interaction_count_map.get(mol_id, 0.0), 5))
+                derived_col = _REPORT_DERIVED_PROP_COLUMNS.get(p)
+                if derived_col:
+                    row = mol_prop_lookup.get(mol_id)
+                    parsed = safe_float(row.get(derived_col)) if row is not None else None
+                    if p == "interaction_count":
+                        vals.append(round(float(parsed or 0.0), 5))
+                    else:
+                        vals.append(round(float(parsed), 5) if parsed is not None else None)
                     continue
                 if mol is not None and mol.HasProp(p):
                     try:
@@ -738,7 +774,7 @@ def build_manifest(args, n_mols, n_scaffolds):
 
 
 def process_sdf_chunk(sdf_path, indices, score_props, id_prop, cluster_prop,
-                      exclude_smiles_list, generate_images):
+                      exclude_smiles_list, generate_images, torsion_smarts=None):
     """Process a list of molecule indices from an SDF file.
 
     Top-level (picklable) worker for ProcessPoolExecutor.
@@ -802,6 +838,7 @@ def process_sdf_chunk(sdf_path, indices, score_props, id_prop, cluster_prop,
             mol_png = None
 
         descriptors = descriptor_dict(mol)
+        descriptors["torsion_angle"] = calculate_torsion_from_smarts(mol, torsion_smarts)
         filter_values = filter_values_from_sdf_or_descriptors(mol, descriptors)
 
         rows.append(
@@ -1203,6 +1240,10 @@ def _load_first_template_molecule(sdf_path):
     return None
 
 
+def _load_first_reference_ligand_molecule(sdf_path):
+    return _load_first_template_molecule(sdf_path)
+
+
 def _export_macrocycle_depictions(report_mol_df, fig_dir, args, run_started):
     """Export macrocycle-friendly 2D PNG depictions for report molecules.
 
@@ -1213,8 +1254,15 @@ def _export_macrocycle_depictions(report_mol_df, fig_dir, args, run_started):
         return
 
     template_mol = None
-    if getattr(args, "use_first_molecule_template", False):
-        template_mol = _load_first_template_molecule(args.input)
+    reference_core_smarts = None
+    first_input_template = _load_first_template_molecule(args.input)
+    if getattr(args, "ref_ligand_sdf", None):
+        template_mol = _load_first_reference_ligand_molecule(args.ref_ligand_sdf)
+        if template_mol is not None and first_input_template is not None:
+            reference_core_smarts = compute_common_core_smarts(template_mol, first_input_template)
+            progress_log(run_started, "Macrocycle 2D template ready", extra="source=reference_ligand_common_core")
+    elif getattr(args, "use_first_molecule_template", False):
+        template_mol = first_input_template
         if template_mol is None:
             eprint("Warning: no valid first molecule found for template; using direct 2D coords.")
         else:
@@ -1267,8 +1315,9 @@ def _export_macrocycle_depictions(report_mol_df, fig_dir, args, run_started):
             mol,
             out_path,
             template_mol=template_mol,
+            ref_pattern=reference_core_smarts,
             legend=mol_id,
-            size=(700, 500),
+            size=(1050, 750),
             strict_template=False,
         )
         if not ok:
@@ -1322,6 +1371,7 @@ def _stage_sdf_parse(args, exclude_patterns, exclude_meta, run_started):
                     args.cluster_prop,
                     exclude_smiles_list,
                     args.generate_all_mol_images,
+                    args.torsion_smarts,
                 ): cidx
                 for cidx, chunk in enumerate(chunks)
             }
@@ -1391,6 +1441,7 @@ def _stage_sdf_parse(args, exclude_patterns, exclude_meta, run_started):
                 mol_png = None
 
             descriptors = descriptor_dict(mol)
+            descriptors["torsion_angle"] = calculate_torsion_from_smarts(mol, args.torsion_smarts)
             filter_values = filter_values_from_sdf_or_descriptors(mol, descriptors)
 
             rows.append(
@@ -1540,6 +1591,7 @@ def _stage_prepare_molecule_listing(mol_df, run_started):
                 "interaction_novelty": None,
                 "scaffold_fsp3": row.get("fsp3"),
                 "scaffold_aliphatic_rings": row.get("rings"),
+                "torsion_angle": row.get("torsion_angle"),
                 "high_distance_central": False,
                 "central_priority": row.get("priority_score", row.get("presentation_score_final", 0.0)),
                 "central_rerank_score": row.get("priority_score", row.get("presentation_score_final", 0.0)),
@@ -1610,8 +1662,18 @@ def _stage_export_and_report(
 
     # Use the same first-template reference for Molecule List 2D alignment when enabled.
     report_reference_smiles = global_reference_smiles
-    if getattr(args, "use_first_molecule_template", False):
-        template_mol = _load_first_template_molecule(args.input)
+    report_reference_core_smarts = None
+    first_input_template = _load_first_template_molecule(args.input)
+    if getattr(args, "ref_ligand_sdf", None):
+        ref_lig_mol = _load_first_reference_ligand_molecule(args.ref_ligand_sdf)
+        if ref_lig_mol is not None and first_input_template is not None:
+            try:
+                report_reference_smiles = Chem.MolToSmiles(ref_lig_mol, isomericSmiles=True)
+            except Exception:
+                pass
+            report_reference_core_smarts = compute_common_core_smarts(ref_lig_mol, first_input_template)
+    elif getattr(args, "use_first_molecule_template", False):
+        template_mol = first_input_template
         if template_mol is not None:
             try:
                 report_reference_smiles = Chem.MolToSmiles(template_mol, isomericSmiles=True)
@@ -1635,8 +1697,10 @@ def _stage_export_and_report(
     scaffold_export_data = None
 
     # Properties panel data: SDF tag values + scaffold→member map.
+    report_prop_names = _get_report_prop_names(args)
+    report_prop_labels = _get_report_prop_labels(args)
     mol_props_data, scaffold_mol_map = _extract_mol_props_for_report(
-        args.input, mol_df, scaf_df, _REPORT_PROP_NAMES, run_started,
+        args.input, mol_df, scaf_df, report_prop_names, run_started,
     )
 
     write_html_report(
@@ -1652,6 +1716,7 @@ def _stage_export_and_report(
         top_per_scaffold=1,
         max_scaffolds_in_report=len(central_df),
         global_reference_smiles=report_reference_smiles,
+        global_reference_core_smarts=report_reference_core_smarts,
         protein_pdb_text=protein_pdb_text,
         protein_cartoon_pdb_text=protein_cartoon_pdb_text,
         protein_structure_format=protein_structure_format,
@@ -1666,6 +1731,8 @@ def _stage_export_and_report(
         pose_interactions_by_index=pose_interactions_by_index,
         mol_props_data=mol_props_data,
         scaffold_mol_map=scaffold_mol_map,
+        prop_names_list=report_prop_names,
+        prop_display_labels=report_prop_labels,
     )
     progress_log(run_started, "HTML report complete",
                  extra=os.path.join(args.outdir, report_filename))
@@ -1683,6 +1750,10 @@ def main():
     # Setup phase: parse CLI, initialize output layout, load exclusion patterns.
     ap = build_cli_parser()
     args = ap.parse_args()
+
+    torsion_err = validate_torsion_smarts(getattr(args, "torsion_smarts", None))
+    if torsion_err:
+        raise SystemExit(f"Error: --torsion-smarts {torsion_err}")
 
     if getattr(args, "ref_ligand_sdf", None):
         args.ref_ligand_sdf = os.path.abspath(args.ref_ligand_sdf)

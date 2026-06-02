@@ -8,6 +8,7 @@ import pandas as pd
 from rdkit import Chem, DataStructs
 from rdkit.Chem import Draw
 from rdkit.Chem import rdDepictor
+from rdkit.Chem import rdFMCS
 from rdkit.Chem import rdMolDescriptors
 from rdkit.Chem.Draw import rdMolDraw2D
 
@@ -15,6 +16,9 @@ from cli_config import prefixed_output_name
 from filtering import weighted_present
 from ranking_helpers import normalize_series
 from shared_utils import hash_text
+
+
+STANDARD_FIXED_BOND_LENGTH = 16.0
 
 
 def variable_positions_from_members(sdf_members):
@@ -127,7 +131,85 @@ def _coerce_template_mol(reference):
     return Chem.Mol(reference)
 
 
-def generate_macrocycle_depiction_coords(mol, template_mol=None, *, strict_template=False):
+def _macrocycle_atom_indices(mol, min_ring_size=8):
+    if mol is None:
+        return set()
+    out = set()
+    try:
+        for ring in mol.GetRingInfo().AtomRings():
+            if len(ring) >= int(min_ring_size):
+                out.update(int(idx) for idx in ring)
+    except Exception:
+        return set()
+    return out
+
+
+def _fragment_from_atom_indices(mol, atom_indices):
+    if mol is None or not atom_indices:
+        return None
+    atom_list = sorted(int(idx) for idx in atom_indices)
+    try:
+        frag_smiles = Chem.MolFragmentToSmiles(
+            mol,
+            atomsToUse=atom_list,
+            canonical=True,
+            isomericSmiles=True,
+        )
+    except Exception:
+        return None
+    if not frag_smiles:
+        return None
+    return Chem.MolFromSmiles(frag_smiles)
+
+
+def compute_common_core_smarts(reference_mol, probe_mol, timeout=10, min_macrocycle_ring_size=8):
+    """Return shared-core SMARTS restricted to macrocyclic-ring atoms when possible."""
+    ref = depiction_mol(reference_mol)
+    probe = depiction_mol(probe_mol)
+    if ref is None or probe is None:
+        return None
+
+    ref_macro_atoms = _macrocycle_atom_indices(ref, min_ring_size=min_macrocycle_ring_size)
+    probe_macro_atoms = _macrocycle_atom_indices(probe, min_ring_size=min_macrocycle_ring_size)
+
+    # Prefer a macrocycle-only core only when both molecules actually expose one.
+    # The crystallographic reference ligand may not itself be macrocyclic.
+    if ref_macro_atoms and probe_macro_atoms:
+        ref_mcs_target = _fragment_from_atom_indices(ref, ref_macro_atoms) or ref
+        probe_mcs_target = _fragment_from_atom_indices(probe, probe_macro_atoms) or probe
+    else:
+        ref_mcs_target = ref
+        probe_mcs_target = probe
+
+    try:
+        mcs = rdFMCS.FindMCS(
+            [ref_mcs_target, probe_mcs_target],
+            timeout=int(timeout),
+            atomCompare=rdFMCS.AtomCompare.CompareElements,
+            bondCompare=rdFMCS.BondCompare.CompareOrderExact,
+            ringMatchesRingOnly=True,
+            completeRingsOnly=True,
+            maximizeBonds=True,
+        )
+    except Exception:
+        return None
+    smarts = str(getattr(mcs, "smartsString", "") or "").strip()
+    if not smarts:
+        return None
+    patt = Chem.MolFromSmarts(smarts)
+    if patt is None or patt.GetNumAtoms() < 4:
+        return None
+    return smarts
+
+
+def generate_macrocycle_depiction_coords(
+    mol,
+    template_mol=None,
+    *,
+    ref_pattern=None,
+    strict_template=False,
+    return_alignment=False,
+):
     """Generate macrocycle-friendly 2D coordinates with optional template matching.
 
     Workflow A: when template_mol is provided, match depiction to template using
@@ -141,39 +223,59 @@ def generate_macrocycle_depiction_coords(mol, template_mol=None, *, strict_templ
     rdDepictor.SetPreferCoordGen(True)
     if template_mol is None:
         rdDepictor.Compute2DCoords(query)
-        return query
+        return (query, False) if return_alignment else query
 
     ref = depiction_mol(template_mol)
     if ref is None:
         if strict_template:
             raise ValueError("template preparation failed")
         rdDepictor.Compute2DCoords(query)
-        return query
+        return (query, False) if return_alignment else query
 
     rdDepictor.Compute2DCoords(ref)
-    if not query.HasSubstructMatch(ref):
+    patt = None
+    if isinstance(ref_pattern, str) and ref_pattern:
+        patt = Chem.MolFromSmarts(ref_pattern)
+    elif ref_pattern is not None:
+        patt = Chem.Mol(ref_pattern)
+
+    if patt is not None:
+        if (not ref.HasSubstructMatch(patt)) or (not query.HasSubstructMatch(patt)):
+            if strict_template:
+                raise ValueError("template mismatch: query does not match reference common core")
+            rdDepictor.Compute2DCoords(query)
+            return (query, False) if return_alignment else query
+    elif not query.HasSubstructMatch(ref):
         if strict_template:
             raise ValueError("template mismatch: query does not match reference template")
         rdDepictor.Compute2DCoords(query)
-        return query
+        return (query, False) if return_alignment else query
 
     try:
-        rdDepictor.GenerateDepictionMatching2DStructure(query, ref)
-        return query
+        if patt is not None:
+            rdDepictor.GenerateDepictionMatching2DStructure(query, ref, -1, patt, True)
+        else:
+            rdDepictor.GenerateDepictionMatching2DStructure(query, ref)
+        return (query, True) if return_alignment else query
     except Exception as exc:
         if strict_template:
             raise RuntimeError(f"depiction generation with template failed: {exc}")
         rdDepictor.Compute2DCoords(query)
-        return query
+        return (query, False) if return_alignment else query
 
 
-def aligned_depiction_mol(mol, reference=None):
+def aligned_depiction_mol(mol, reference=None, ref_pattern=None):
     mc = depiction_mol(mol)
     if mc is None:
         return None
     ref_mol = _coerce_template_mol(reference)
     try:
-        return generate_macrocycle_depiction_coords(mc, template_mol=ref_mol, strict_template=False)
+        return generate_macrocycle_depiction_coords(
+            mc,
+            template_mol=ref_mol,
+            ref_pattern=ref_pattern,
+            strict_template=False,
+        )
     except Exception:
         try:
             rdDepictor.Compute2DCoords(mc)
@@ -187,6 +289,7 @@ def write_macrocycle_depiction_png(
     out_path,
     *,
     template_mol=None,
+    ref_pattern=None,
     legend="",
     size=(1050, 750),
     strict_template=False,
@@ -204,6 +307,7 @@ def write_macrocycle_depiction_png(
         dep = generate_macrocycle_depiction_coords(
             mol,
             template_mol=template_mol,
+            ref_pattern=ref_pattern,
             strict_template=strict_template,
         )
     except Exception as exc:
@@ -219,7 +323,7 @@ def write_macrocycle_depiction_png(
         dopts = drawer.drawOptions()
         dopts.addStereoAnnotation = False
         dopts.explicitMethyl = False
-        dopts.fixedBondLength = 24.0
+        dopts.fixedBondLength = STANDARD_FIXED_BOND_LENGTH
         drawer.DrawMolecule(dep, legend=str(legend or ""))
         drawer.FinishDrawing()
         with open(out_path, "wb") as fh:
@@ -238,20 +342,71 @@ def mol_png_base64(mol, size=(260, 180), legend="", reference=None):
     dopts.addStereoAnnotation = False
     dopts.explicitMethyl = False
     # Keep a consistent medicinal-chem style bond length across canvases.
-    dopts.fixedBondLength = 24.0
+    dopts.fixedBondLength = STANDARD_FIXED_BOND_LENGTH
     drawer.DrawMolecule(mc, legend=legend)
     drawer.FinishDrawing()
     data = drawer.GetDrawingText()
     return base64.b64encode(data).decode("ascii")
 
 
-def mol_png_base64_from_smiles(smiles, size=(260, 180), legend="", reference_smiles=None):
+def mol_png_base64_from_smiles(smiles, size=(260, 180), legend="", reference_smiles=None, reference_core_smarts=None):
     if not smiles:
         return None
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
-    return mol_png_base64(mol, size=size, legend=legend, reference=reference_smiles)
+    mc = aligned_depiction_mol(mol, reference=reference_smiles, ref_pattern=reference_core_smarts)
+    if mc is None:
+        return None
+    drawer = rdMolDraw2D.MolDraw2DCairo(size[0], size[1])
+    dopts = drawer.drawOptions()
+    dopts.addStereoAnnotation = False
+    dopts.explicitMethyl = False
+    dopts.fixedBondLength = STANDARD_FIXED_BOND_LENGTH
+    drawer.DrawMolecule(mc, legend=legend)
+    drawer.FinishDrawing()
+    data = drawer.GetDrawingText()
+    return base64.b64encode(data).decode("ascii")
+
+
+def mol_png_base64_from_smiles_with_status(smiles, size=(260, 180), legend="", reference_smiles=None, reference_core_smarts=None):
+    """Return depiction image and whether template alignment succeeded.
+
+    Returns
+    -------
+    tuple(str|None, bool)
+        (png_b64, aligned_to_template)
+    """
+    if not smiles:
+        return None, False
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None, False
+
+    ref_mol = _coerce_template_mol(reference_smiles)
+    try:
+        dep, aligned = generate_macrocycle_depiction_coords(
+            mol,
+            template_mol=ref_mol,
+            ref_pattern=reference_core_smarts,
+            strict_template=False,
+            return_alignment=True,
+        )
+    except Exception:
+        return None, False
+
+    try:
+        drawer = rdMolDraw2D.MolDraw2DCairo(size[0], size[1])
+        dopts = drawer.drawOptions()
+        dopts.addStereoAnnotation = False
+        dopts.explicitMethyl = False
+        dopts.fixedBondLength = STANDARD_FIXED_BOND_LENGTH
+        drawer.DrawMolecule(dep, legend=legend)
+        drawer.FinishDrawing()
+        data = drawer.GetDrawingText()
+        return base64.b64encode(data).decode("ascii"), bool(aligned)
+    except Exception:
+        return None, False
 
 
 def scaffold_tick_image(smiles, size=(220, 120)):

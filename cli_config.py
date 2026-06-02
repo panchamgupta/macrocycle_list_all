@@ -132,6 +132,20 @@ def build_cli_parser():
         ),
     )
     ap.add_argument(
+        "--torsion-smarts",
+        default=None,
+        help=(
+            "Optional SMARTS pattern defining exactly four atoms for a torsion angle. "
+            "When provided, the report computes one torsion per molecule using the first SMARTS match "
+            "and exposes it in the Molecule Properties filters and plots."
+        ),
+    )
+    ap.add_argument(
+        "--torsion-label",
+        default="Torsion (deg)",
+        help="Display label for the optional torsion property in the HTML report.",
+    )
+    ap.add_argument(
         "-n", "--n-workers",
         type=int,
         default=0,
